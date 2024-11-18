@@ -1,0 +1,133 @@
+[Stage 0: Import Libraries]
+# this definition exposes all python module imports that should be available in all subsequent commands
+import json
+import numpy as np
+import pandas as pd
+import os
+import datetime
+import tensorflow as tf
+from tensorflow import keras
+# ...
+# global constants
+MODEL_DIRECTORY = "/srv/app/model/data/"
+
+# THIS CELL IS NOT EXPORTED - free notebook cell for testing or development purposes
+print("numpy version: " + np.__version__)
+print("pandas version: " + pd.__version__)
+print("tensorflow version: " + tf.__version__)
+print("keras version: " + keras.__version__)
+
+
+[Stage 1: Get Data from Splunk]
+search = SplunkSearch.SplunkSearch(search='| inputlookup diabetes.csv')
+
+| inputlookup diabetes.csv
+| fit MLTKContainer algo=my_classification response mode=stage from BMI age blood_pressure diabetes_pedigree glucose_concentration number_pregnant serum_insulin skin_thickness 
+into app:diabetes_classification_model
+
+# THIS CELL IS NOT EXPORTED - free notebook cell for testing or development purposes
+df, param = stage("diabetes_classification_model")
+
+
+[Stage 2: Create and Initialize a Model]
+# initialize your model
+# available inputs: data and parameters
+# returns the model object which will be used as a reference to call fit, apply and summary subsequently
+def init(df,param):
+    X = df[param['feature_variables']]
+    print("FIT build model with input shape " + str(X.shape))
+    input_shape = int(X.shape[1])
+    model_structure = '2-2'
+    if 'options' in param:
+        if 'params' in param['options']:
+            if 'structure' in param['options']['params']:
+                model_structure = str(param['options']['params']['structure']).lstrip("\"").rstrip("\"")
+    hidden_factors = np.floor(np.array(model_structure.split("-"), dtype="float") * X.shape[1])
+    model = keras.Sequential()
+    model.add(keras.layers.Dense(input_shape, input_dim=input_shape, activation=tf.nn.relu))
+    for hidden in hidden_factors:
+        model.add(keras.layers.Dense(int(hidden), activation=tf.nn.relu))
+    model.add(keras.layers.Dense(1, activation=tf.nn.sigmoid))
+    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+    return model
+
+# THIS CELL IS NOT EXPORTED - free notebook cell for testing or development purposes
+model = init(df,param)
+print(model.summary())
+
+
+[Stage 3: Fit The Model]
+# train your model
+# returns a fit info json object and may modify the model object
+def fit(model,df,param):
+    returns = {}
+    X = df[param['feature_variables']]
+    Y = df[param['target_variables']]
+    model_epochs = 100
+    model_batch_size = None
+    if 'options' in param:
+        if 'params' in param['options']:
+            if 'epochs' in param['options']['params']:
+                model_epochs = int(param['options']['params']['epochs'])
+            if 'batch_size' in param['options']['params']:
+                model_batch_size = int(param['options']['params']['batch_size'])
+    # connect model training to tensorboard
+    log_dir="/srv/notebooks/logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+    # run the training
+    returns['fit_history'] = model.fit(x=X,
+                                       y=Y, 
+                                       verbose=2, 
+                                       epochs=model_epochs, 
+                                       batch_size=model_batch_size, 
+                                       #validation_data=(X, Y),
+                                       callbacks=[tensorboard_callback])
+    # memorize parameters
+    returns['model_epochs'] = model_epochs
+    returns['model_batch_size'] = model_batch_size
+    returns['model_loss_acc'] = model.evaluate(x = X, y = Y)
+    return returns
+
+# THIS CELL IS NOT EXPORTED - free notebook cell for testing or development purposes
+param['options']['params']['epochs'] = 500
+print(fit(model,df,param))
+
+
+[Stage 4: Apply The Model]
+# apply your model
+# returns the calculated results
+def apply(model,df,param):
+    X = df[param['feature_variables']]
+    y_hat = model.predict(x = X, verbose=1)
+    return y_hat
+
+
+[Stage 5&6: Save/Load The Model]
+# save model to name in expected convention "<algo_name>_<model_name>"
+def save(model,name):
+    # save keras model to hdf5 file
+    # https://www.tensorflow.org/beta/tutorials/keras/save_and_restore_models
+    model.save(MODEL_DIRECTORY + name + ".h5")
+    return model
+
+# load model from name in expected convention "<algo_name>_<model_name>"
+def load(name):
+    model = keras.models.load_model(MODEL_DIRECTORY + name + ".h5")
+    return model
+
+[Fit & Apply Command at Splunk]
+| inputlookup diabetes.csv 
+| fit MLTKContainer algo=my_classification epochs=500 batch_size=8 response from BMI age blood_pressure diabetes_pedigree glucose_concentration number_pregnant serum_insulin skin_thickness 
+    into app:diabetes_classification_model 
+| eval response_prediction = if('predicted_response'>=0.5,1,0) 
+| fields response* predicted_response *
+
+| inputlookup diabetes.csv 
+| apply app:diabetes_classification_model
+| eval response_prediction = if('predicted_response'>=0.5,1,0) 
+| fields response* predicted_response *
+
+
+
+
+
